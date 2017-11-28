@@ -1,3 +1,5 @@
+# Samuel Conrad and Josh Jibilian
+
 from grid import *
 from particle import Particle
 from utils import *
@@ -21,12 +23,12 @@ def motion_update(particles, odom):
 
     oldPos = odom[0]
     newPos = odom[1]
-    alpha1 = 0.02
-    alpha2 = 0.02
-    alpha3 = 0.02
-    alpha4 = 0.02
+    alpha1 = 0.001
+    alpha2 = 0.001
+    alpha3 = 0.001
+    alpha4 = 0.001
 
-    rot1 = math.atan2(newPos[1] - oldPos[1], newPos[0] - oldPos[0]) - oldPos[2]
+    rot1 = math.degrees(math.atan2(newPos[1] - oldPos[1], newPos[0] - oldPos[0])) - oldPos[2]
     trans = grid_distance(oldPos[0],oldPos[1],newPos[0], newPos[1])
     rot2 = newPos[2] - oldPos[2] - rot1
 
@@ -36,8 +38,13 @@ def motion_update(particles, odom):
 
     for particle in particles:
         particle.x = particle.x + newTrans * math.cos(math.radians(particle.h + newRot1))
+        particle.x = add_gaussian_noise(particle.x, ODOM_TRANS_SIGMA)
+
         particle.y = particle.y + newTrans * math.sin(math.radians(particle.h + newRot1))
+        particle.y = add_gaussian_noise(particle.y, ODOM_TRANS_SIGMA)
+
         particle.h = particle.h + newRot1 + newRot2
+        particle.h = add_gaussian_noise(particle.h, ODOM_HEAD_SIGMA)
 
         newParticles.append(particle)
 
@@ -67,6 +74,7 @@ def measurement_update(particles, measured_marker_list, grid):
 
     if len(measured_marker_list) != 0:
         for particle in particles:
+            # Obtain list of localization markers 
             visibleMarkers = particle.read_markers(grid)
 
             shouldAppendParticle = particle.x >= grid.width or particle.x < 0 or particle.y >= grid.height or particle.y < 0 or (particle.x, particle.y) in grid.occupied
@@ -78,24 +86,28 @@ def measurement_update(particles, measured_marker_list, grid):
                 pairs = []
                 for measuredMarker in measured_marker_list:
                     if len(visibleMarkers) != 0:
+                        # find closest marker
                         nearestMarker = findNearestMarker(measuredMarker, visibleMarkers)
+                        # remove from possible future pairings
                         visibleMarkers.remove(nearestMarker)
+                        # store pairings
                         pairs.append((nearestMarker, measuredMarker))
 
-                probability = getProbability(pairs, mmlLength, vmLength)
-                weightArr.append((particle, probability))
+                weightArr.append((particle, getProbability(pairs, mmlLength, vmLength)))
 
         counter2 = 0
         remove = int(PARTICLE_COUNT / 100)
+        
+        #update weights
         weightArr.sort(key=lambda x: x[1])
         weightArr = weightArr[remove:]
         for i, j in weightArr:
             if j != 0:
-                counter2 += j
-            else:
-                counter += 1
+                counter2 = counter2 + j
+            if j == 0:
+                counter = counter + 1
         weightArr = weightArr[counter:]
-        counter += remove
+        counter = counter + remove
     else:
         counter2 = 1
         for p in particles:
@@ -104,10 +116,11 @@ def measurement_update(particles, measured_marker_list, grid):
     particleList = []
     weightList = []
     for i, j in weightArr:
-        newParticle = Particle(i.x, i.y, i.h)
-        weightList.append(j / counter2)
-        particleList.append(newParticle)
+        weight = j / counter2
+        weightList.append(weight)
+        particleList.append(Particle(i.x, i.y, i.h))
 
+    # Create new particle list by random
     newParticleList = []
     if particleList != []:
         newParticleList = numpy.random.choice(particleList, size=len(particleList), replace=True, p=weightList)
@@ -121,32 +134,40 @@ def findNearestMarker(measuredMarker, visibleMarkers):
     nearestMarker = visibleMarkers[0]
     nearestDistance = grid_distance(measuredMarkerX, measuredMarkerY, nearestMarker[0], nearestMarker[1])
     for visibleMarker in visibleMarkers:
-        visibleMarkerX, visibleMarkerY, _ = visibleMarker[0], visibleMarker[1], visibleMarker[2]
-        dist = grid_distance(measuredMarkerX, measuredMarkerY, visibleMarkerX, visibleMarkerY)
-        if dist < nearestDistance:
+        visibleMarkerX = visibleMarker[0]
+        visibleMarkerY = visibleMarker[1]
+        distance = grid_distance(measuredMarkerX, measuredMarkerY, visibleMarkerX, visibleMarkerY)
+        if distance < nearestDistance:
             nearestMarker = visibleMarker
-            nearestDistance = dist
+            nearestDistance = distance
     
     return nearestMarker
 
 def getProbability(pairs, mmlLength, vmLength):
     probability = 1
     transConstantMax = 0
-    transConstant = 2 * (MARKER_TRANS_SIGMA ** 2)
-    rotConstant = 2 * (MARKER_ROT_SIGMA ** 2)
     for p1, p2 in pairs:
+        # euclidean distance of each pair
         markerDistance = grid_distance(p1[0], p1[1], p2[0], p2[1])
         markerAngle = diff_heading_deg(p1[2], p2[2])
-        newTransConstant = (markerDistance ** 2) / transConstant
-        newRotConstant = (markerAngle ** 2) / rotConstant
-        transConstantMax = max(transConstantMax, newTransConstant)
-        probability = probability * numpy.exp(-newTransConstant - newRotConstant)
 
+        # a: distBetweenMarkers^2 / (2 * (standard deviation of the gaussian model for translation)^2)
+        transConstantMax = max(transConstantMax, (markerDistance ** 2) / (2 * (MARKER_TRANS_SIGMA ** 2)))
+
+        # b: angleBetweenMarkers^2 / (2 * (standard deviation for rotation measurements)^2)
+        newRotConstant = (markerAngle ** 2) / (2 * (MARKER_ROT_SIGMA ** 2))
+
+        # p = e^-(a + b)
+        power = ((markerDistance ** 2) / (2 * (MARKER_TRANS_SIGMA ** 2))) + newRotConstant
+        probability = probability * numpy.exp(-power)
+
+    # handle measured marker and visible marker difference
     rotConstantMax = (45 ** 2) / (2 * (MARKER_ROT_SIGMA ** 2))
-
-    difference = int(math.fabs(mmlLength - vmLength))
-    for _ in range(difference):
+    difference = math.fabs(mmlLength - vmLength)
+    count = 0
+    while count < int(difference):
         probability = probability * numpy.exp(-transConstantMax - rotConstantMax)
+        count = count + 1
     
     return probability
 
